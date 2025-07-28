@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+Enhanced Network Port Scanner
+A comprehensive port scanning tool with custom data structures
+and multi-threading capabilities for educational purposes.
+
+Author: [Your Name]
+Course: ST5062CEM Programming and Algorithms 2
+"""
+
+import socket
+import threading
+import time
+import argparse
+import json
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+from enum import Enum
+import logging
+from datetime import datetime
+import heapq
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Try to import colorama for colored output
+try:
+    from colorama import init, Fore, Style
+    init()  # Initialize for Windows compatibility
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    COLORAMA_AVAILABLE = False
+    print("Warning: colorama not available. Install with 'pip install colorama' for colored output.")
+    Fore = Style = type('Dummy', (), {'__getattr__': lambda self, name: ''})()
+
+
+# ==================== CUSTOM DATA STRUCTURES ====================
+
+class CustomHashTable:
+    """
+    Custom hash table implementation for storing scan results.
+    Uses chaining for collision resolution and dynamic resizing.
+    Provides O(1) average case insertion and lookup.
+    """
+    def __init__(self, initial_size: int = 1000):
+        self.size = initial_size
+        self.count = 0
+        self.threshold = 0.75  # Load factor threshold for resizing
+        self.table = [[] for _ in range(self.size)]
+        self._lock = threading.Lock()  # Thread safety
+
+    def _hash(self, key: str) -> int:
+        return hash(key) % self.size
+
+    def _resize(self):
+        old_table = self.table
+        old_size = self.size
+
+        self.size *= 2
+        self.count = 0
+        self.table = [[] for _ in range(self.size)]
+
+        for bucket in old_table:
+            for key, value in bucket:
+                self._insert_without_lock(key, value)
+
+        logger.debug(f"Hash table resized from {old_size} to {self.size}")
+
+    def _insert_without_lock(self, key: str, value) -> None:
+        index = self._hash(key)
+        bucket = self.table[index]
+
+        for i, (k, v) in enumerate(bucket):
+            if k == key:
+                bucket[i] = (key, value)
+                return
+
+        bucket.append((key, value))
+        self.count += 1
+
+    def insert(self, key: str, value) -> None:
+        with self._lock:
+            if self.count >= self.size * self.threshold:
+                self._resize()
+            self._insert_without_lock(key, value)
+
+    def get(self, key: str):
+        with self._lock:
+            index = self._hash(key)
+            bucket = self.table[index]
+            for k, v in bucket:
+                if k == key:
+                    return v
+            return None
+
+    def get_all_values(self) -> List:
+        with self._lock:
+            values = []
+            for bucket in self.table:
+                for key, value in bucket:
+                    values.append(value)
+            return values
+
+    def get_statistics(self) -> Dict:
+        with self._lock:
+            bucket_lengths = [len(bucket) for bucket in self.table]
+            return {
+                'size': self.size,
+                'count': self.count,
+                'load_factor': self.count / self.size,
+                'max_bucket_length': max(bucket_lengths) if bucket_lengths else 0,
+                'avg_bucket_length': sum(bucket_lengths) / len(bucket_lengths) if bucket_lengths else 0
+            }
+
+
+class ThreadSafePriorityQueue:
+    """
+    Thread-safe priority queue implementation for managing scan order.
+    Lower priority numbers indicate higher priority.
+    Common ports receive higher priority for faster discovery.
+    """
+    def __init__(self):
+        self._queue = []
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def put(self, item: any, priority: int = 1) -> None:
+        with self._lock:
+            heapq.heappush(self._queue, (priority, self._index, item))
+            self._index += 1
+
+    def get(self) -> Optional[any]:
+        with self._lock:
+            if self._queue:
+                priority, index, item = heapq.heappop(self._queue)
+                return item
+            return None
+
+    def empty(self) -> bool:
+        with self._lock:
+            return len(self._queue) == 0
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._queue)
+
+
+# ==================== DATA CLASSES AND ENUMS ====================
+
+class PortStatus(Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+    FILTERED = "filtered"
+    OPEN_FILTERED = "open|filtered"
+
+
+class ScanType(Enum):
+    TCP_CONNECT = "tcp_connect"
+    TCP_SYN = "tcp_syn"
+    UDP = "udp"
+
+
+@dataclass
+class ServiceInfo:
+    name: str
+    version: Optional[str] = None
+    banner: Optional[str] = None
+    confidence: float = 0.0
+
+
+@dataclass
+class ScanResult:
+    target: str
+    port: int
+    protocol: str
+    status: PortStatus
+    service: Optional[ServiceInfo] = None
+    response_time: Optional[float] = None
+    timestamp: datetime = None
+    scan_type: ScanType = ScanType.TCP_CONNECT
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+
+    def to_dict(self) -> Dict:
+        return {
+            'target': self.target,
+            'port': self.port,
+            'protocol': self.protocol,
+            'status': self.status.value,
+            'service_name': self.service.name if self.service else None,
+            'service_version': self.service.version if self.service else None,
+            'banner': self.service.banner if self.service else None,
+            'response_time': self.response_time,
+            'timestamp': self.timestamp.isoformat(),
+            'scan_type': self.scan_type.value
+        }
+
+
+# ==================== MAIN SCANNER CLASS ====================
+
+class NetworkPortScanner:
+    """
+    Main scanner class that orchestrates the scanning process.
+    Implements multi-threaded scanning with custom data structures.
+    """
+    def __init__(self, max_threads: int = 100, timeout: float = 3.0):
+        self.max_threads = max_threads
+        self.timeout = timeout
+        self.results = CustomHashTable()
+        self.port_queue = ThreadSafePriorityQueue()
+        self.stats = {
+            'scan_start_time': None,
+            'scan_end_time': None,
+            'total_ports': 0,
+            'open_ports': 0,
+            'closed_ports': 0,
+            'filtered_ports': 0
+        }
+
+        # Common ports that should be prioritized
+        self.common_ports = {
+            21: 0,   # FTP
+            22: 0,   # SSH
+            23: 0,   # Telnet
+            25: 0,   # SMTP
+            53: 0,   # DNS
+            80: 0,   # HTTP
+            110: 0,  # POP3
+            143: 0,  # IMAP
+            443: 0,  # HTTPS
+            993: 0,  # IMAPS
+            995: 0,  # POP3S
+        }
+
+    def _get_service_name(self, port: int) -> str:
+        """Return common service name based on port."""
+        services = {
+            21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
+            53: "DNS", 80: "HTTP", 110: "POP3", 143: "IMAP",
+            443: "HTTPS", 993: "IMAPS", 995: "POP3S"
+        }
+        return services.get(port, "unknown")
+
+    def _scan_tcp_port(self, target: str, port: int) -> ScanResult:
+        """Scan a single TCP port using connect() method."""
+        start_time = time.time()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout)
+                result = sock.connect_ex((target, port))
+                response_time = time.time() - start_time
+
+                if result == 0:
+                    status = PortStatus.OPEN
+                    try:
+                        sock.settimeout(2)
+                        banner = sock.recv(1024).decode().strip()
+                    except:
+                        banner = "N/A"
+                    service_name = self._get_service_name(port)
+                    service = ServiceInfo(name=service_name, banner=banner, confidence=0.8)
+                else:
+                    status = PortStatus.CLOSED
+                    service = None
+
+                return ScanResult(
+                    target=target,
+                    port=port,
+                    protocol="TCP",
+                    status=status,
+                    service=service,
+                    response_time=response_time,
+                    scan_type=ScanType.TCP_CONNECT
+                )
+
+        except socket.timeout:
+            return ScanResult(
+                target=target,
+                port=port,
+                protocol="TCP",
+                status=PortStatus.FILTERED,
+                response_time=None,
+                scan_type=ScanType.TCP_CONNECT
+            )
+        except Exception as e:
+            logger.debug(f"Error scanning port {port}: {e}")
+            return ScanResult(
+                target=target,
+                port=port,
+                protocol="TCP",
+                status=PortStatus.FILTERED,
+                response_time=None,
+                scan_type=ScanType.TCP_CONNECT
+            )
+
+    def _populate_port_queue(self, target: str, ports: List[int]) -> None:
+        """Populate the port queue with ports, prioritizing common services."""
+        for port in ports:
+            priority = self.common_ports.get(port, 1)
+            self.port_queue.put((target, port), priority)
+        self.stats['total_ports'] = len(ports)
+
+    def scan(self, target: str, ports: List[int]) -> None:
+        """Run the scan on the given target and ports."""
+        self._populate_port_queue(target, ports)
+        self.stats['scan_start_time'] = datetime.now()
+
+        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+            futures = []
+            while not self.port_queue.empty():
+                task = self.port_queue.get()
+                if task:
+                    target_host, port = task
+                    futures.append(executor.submit(self._scan_tcp_port, target_host, port))
+
+            for future in as_completed(futures):
+                result = future.result()
+                self.results.insert(f"{result.target}:{result.port}", result)
+                if result.status == PortStatus.OPEN:
+                    self.stats['open_ports'] += 1
+                elif result.status == PortStatus.CLOSED:
+                    self.stats['closed_ports'] += 1
+                else:
+                    self.stats['filtered_ports'] += 1
+
+        self.stats['scan_end_time'] = datetime.now()
+
+
+# ==================== CLI VERSION ====================
+
+def run_cli():
+    """Run the Command-Line Interface version."""
+    parser = argparse.ArgumentParser(description="Enhanced Network Port Scanner")
+    parser.add_argument("target", help="Target IP address or hostname")
+    parser.add_argument("-p", "--ports", help="Port range (e.g. 20-80) or comma-separated list", default="1-100")
+    parser.add_argument("-t", "--threads", type=int, default=100, help="Max threads (default: 100)")
+
+    args = parser.parse_args()
+
+    # Parse ports
+    ports = []
+    for part in args.ports.split(','):
+        if '-' in part:
+            start, end = part.split('-')
+            ports.extend(range(int(start), int(end) + 1))
+        else:
+            ports.append(int(part))
+
+    print(f"{Fore.CYAN}🔍 Scanning {args.target} on {len(ports)} ports...{Style.RESET_ALL}")
+    scanner = NetworkPortScanner(max_threads=args.threads)
+    scanner.scan(args.target, ports)
+
+    # Display results
+    print(f"\n{Fore.GREEN}{'Port':<8} {'Status':<12} {'Service':<15} {'Banner'}{Style.RESET_ALL}")
+    print("-" * 60)
+    for result in scanner.results.get_all_values():
+        if result.status == PortStatus.OPEN:
+            banner = result.service.banner if result.service else "N/A"
+            print(f"{Fore.GREEN}{result.port:<8} {result.status.value:<12} {result.service.name:<15} {banner}{Style.RESET_ALL}")
+        elif result.status == PortStatus.FILTERED:
+            print(f"{Fore.YELLOW}{result.port:<8} {result.status.value:<12} {'unknown':<15} {'No response'}{Style.RESET_ALL}")
+
+    # Final stats
+    duration = scanner.stats['scan_end_time'] - scanner.stats['scan_start_time']
+    print(f"\n{Fore.BLUE}✅ Scan completed in {duration}{Style.RESET_ALL}")
+    print(f"📊 Open ports: {scanner.stats['open_ports']}")
+    print(f"🔒 Closed/Filtered: {scanner.stats['closed_ports'] + scanner.stats['filtered_ports']}")
+
+
+# ==================== GUI VERSION ====================
+
+def run_gui():
+    """Run the Graphical User Interface version."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox, scrolledtext
+    except ImportError:
+        print("Tkinter not available. GUI requires tkinter.")
+        return
+
+    def start_scan():
+        target = entry_target.get().strip()
+        port_input = entry_ports.get().strip()
+        if not target or not port_input:
+            messagebox.showerror("Input Error", "Please enter target and port range.")
+            return
+
+        # Parse ports
+        ports = []
+        try:
+            for part in port_input.split(','):
+                if '-' in part:
+                    start, end = part.split('-')
+                    ports.extend(range(int(start), int(end) + 1))
+                else:
+                    ports.append(int(part))
+        except:
+            messagebox.showerror("Input Error", "Invalid port format. Use 80, 20-85, or 22,80,443")
+            return
+
+        # Run scan in background
+        def scan_task():
+            try:
+                scanner = NetworkPortScanner()
+                scanner.scan(target, ports)
+                result_text = "\n".join([
+                    f"[{result.status.value.upper()}] Port {result.port} ({result.protocol}) - {result.service.name if result.service else 'Unknown'}: {result.service.banner if result.service and result.service.banner != 'N/A' else ''}"
+                    for result in scanner.results.get_all_values()
+                    if result.status == PortStatus.OPEN
+                ]) or "No open ports found."
+
+                duration = scanner.stats['scan_end_time'] - scanner.stats['scan_start_time']
+                result_text += f"\n\nScan completed in {duration}\nOpen ports: {scanner.stats['open_ports']}"
+
+                # Update GUI
+                text_output.delete(1.0, tk.END)
+                text_output.insert(tk.END, result_text)
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        # Run in separate thread to avoid freezing GUI
+        threading.Thread(target=scan_task, daemon=True).start()
+
+    # Create GUI window
+    root = tk.Tk()
+    root.title("Enhanced Network Port Scanner")
+    root.geometry("700x500")
+    root.resizable(False, False)
+
+    # Style
+    style = ttk.Style()
+    style.theme_use('clam')
+
+    # Frame
+    frame = ttk.Frame(root, padding="10")
+    frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+    # Widgets
+    ttk.Label(frame, text="Target IP/Hostname:").grid(row=0, column=0, sticky=tk.W, pady=5)
+    entry_target = ttk.Entry(frame, width=30)
+    entry_target.grid(row=0, column=1, pady=5)
+
+    ttk.Label(frame, text="Ports (e.g. 20-85 or 22,80,443):").grid(row=1, column=0, sticky=tk.W, pady=5)
+    entry_ports = ttk.Entry(frame, width=30)
+    entry_ports.grid(row=1, column=1, pady=5)
+
+    btn_scan = ttk.Button(frame, text="Start Scan", command=start_scan)
+    btn_scan.grid(row=2, column=0, columnspan=2, pady=10)
+
+    text_output = scrolledtext.ScrolledText(frame, width=80, height=20, font=("Courier", 10))
+    text_output.grid(row=3, column=0, columnspan=2, pady=10)
+
+    # Default values
+    entry_target.insert(0, "127.0.0.1")
+    entry_ports.insert(0, "20-85")
+
+    root.mainloop()
+
+
+# ==================== MAIN FUNCTION ====================
+
+if __name__ == "__main__":
+    print(f"{Fore.CYAN}Choose interface:{Style.RESET_ALL}")
+    print("1. Command-Line Interface (CLI)")
+    print("2. Graphical User Interface (GUI)")
+    
+    choice = input("Enter 1 or 2: ").strip()
+    
+    if choice == "1":
+        run_cli()
+    elif choice == "2":
+        run_gui()
+    else:
+        print(f"{Fore.RED}Invalid choice. Running CLI...{Style.RESET_ALL}")
+        run_cli()
